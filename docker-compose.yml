@@ -1,0 +1,29 @@
+services:
+  api:
+    build: .
+    image: sample-lineage-api:latest
+    container_name: sample-lineage-api
+    ports:
+      - "8000:8000"
+    environment:
+      # 容器内监听端口与 SQLite 路径
+      PORT: "8000"
+      DATABASE_PATH: /data/lineage.db
+      # 体积/份额保留的小数位数
+      DECIMAL_SCALE: "9"
+      # 查询结果中比例输出的小数位数
+      PROPORTION_SCALE: "6"
+      # Decimal 中间运算精度
+      DECIMAL_PRECISION: "50"
+    volumes:
+      - lineage-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; json.load(urllib.request.urlopen('http://localhost:8000/health'))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  lineage-data:
