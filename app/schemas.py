@@ -55,6 +55,43 @@ class CapacityIn(BaseModel):
     )
 
 
+class CompatibilityRuleIn(BaseModel):
+    """一条祖先来源不相容规则（无向禁配对）：两端均为初始样品 ID，顺序无关。"""
+
+    source_a: str = Field(..., min_length=1, description="禁配对一端（初始样品 ID）")
+    source_b: str = Field(..., min_length=1, description="禁配对另一端（初始样品 ID）")
+
+    @field_validator("source_a", "source_b")
+    @classmethod
+    def _ids(cls, v: str) -> str:
+        return _check_id(v)
+
+
+class CompatibilityRulesIn(BaseModel):
+    """PUT /compatibility/rules 的请求体：原子全量替换禁配规则表。"""
+
+    rules: list[CompatibilityRuleIn] = Field(
+        ...,
+        description=(
+            "替换后的完整禁配规则列表；空列表表示清空全部规则。"
+            "每对两个 ID 顺序无关（A-B 与 B-A 去重）；拒绝自配对与未登记为"
+            "初始样品的 ID。"
+        ),
+    )
+
+
+class CompatibilityRuleOut(BaseModel):
+    source_a: str = Field(..., description="规范化后字典序较小的一端")
+    source_b: str = Field(..., description="规范化后字典序较大的一端")
+
+
+class CompatibilityRulesOut(BaseModel):
+    rules: list[CompatibilityRuleOut] = Field(
+        ...,
+        description="当前生效的全部禁配规则，规范化后按 (source_a, source_b) 排序",
+    )
+
+
 class TransferIn(BaseModel):
     source: str = Field(..., min_length=1, description="源容器 ID")
     destination: str = Field(..., min_length=1, description="目标容器 ID")

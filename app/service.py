@@ -19,6 +19,15 @@
   中含条目序号、目标容器与预计超出量）；同批先转出再转入按当时余量判断。
   容量校验与转移在同一事务内：失败时容器状态、版本、幂等记录与审计链均不
   变化；已成功请求的幂等重放直接返回首次结果，不重新校验容量。
+* 可维护一份**祖先来源不相容规则**（``compatibility_rules`` 表，无向禁配对，
+  见 :func:`replace_compatibility_rules` / :func:`get_compatibility_rules`）：
+  PUT 原子全量替换（A-B 与 B-A 去重、拒绝自配对与未登记为初始样品的 ID），
+  GET 返回规范化排序后的规则。批量提交与预演复用同一顺序模拟，在每一步
+  分摊后检查**目标容器的非零祖先集合**是否同时含有某一禁配对的双方；命中
+  即整批拒绝（422 incompatible_sources，``details`` 含条目序号、目标容器与
+  排序后的全部冲突对）。同批前序混合产生的隐性祖先随模拟状态自然参与后续
+  步骤的检查。规则只约束其后的转移，不回溯既有容器；规则变更本身不是批量
+  转移（不递增 version、不产生审计记录）。
 * 预演（preview）与真实提交共享同一份校验与分摊实现（见
   :func:`_simulate_transfers`），错误码与条目序号完全一致；
   预演只读不写（不递增 version），无论成功失败都不改变数据库，但返回中给出
@@ -180,7 +189,9 @@ def register_initial_sample(
     conn.execute("BEGIN")
     try:
         try:
-            conn.execute("INSERT INTO containers (id) VALUES (?)", (sample_id,))
+            conn.execute(
+                "INSERT INTO containers (id, is_sample) VALUES (?, 1)", (sample_id,)
+            )
         except sqlite3.IntegrityError:
             raise LineageError(
                 409, "container_exists", f"容器/样品 '{sample_id}' 已存在"
@@ -260,6 +271,95 @@ def set_container_capacity(
         conn.execute("ROLLBACK")
         raise
     return _format_container_status(cid, state, version, capacity)
+
+
+# --------------------------------------------------------------------------- #
+# 祖先来源不相容规则（无向禁配对）
+# --------------------------------------------------------------------------- #
+def _load_compatibility_rules(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    """读取当前生效的全部禁配对（库中已规范化存储，按 (source_a, source_b) 排序）。"""
+    return [
+        (r["source_a"], r["source_b"])
+        for r in conn.execute(
+            "SELECT source_a, source_b FROM compatibility_rules"
+            " ORDER BY source_a, source_b"
+        )
+    ]
+
+
+def replace_compatibility_rules(
+    conn: sqlite3.Connection, pairs: Iterable[tuple[str, str]]
+) -> dict:
+    """原子全量替换祖先来源不相容规则（无向禁配对）。
+
+    每对的两个 ID 顺序无关：A-B 与 B-A 视为同一条规则，规范化为字典序
+    ``(source_a < source_b)`` 后去重存储；空列表表示清空全部规则。
+    自配对（两端相同）拒绝 422 ``self_pair``；引用的 ID 必须已登记为
+    **初始样品**（空容器或未知 ID 均拒绝 422 ``unknown_sample``，
+    ``details`` 列出全部未登记 ID）。校验与“清空 + 写入”在同一个写事务内
+    完成：任一失败旧规则完全不变（原子全量替换）。
+
+    规则变更不是批量转移：不递增 ``version``、不产生审计记录；规则只约束
+    其后的转移，不回溯既有容器。返回规范化排序后的完整规则表（与
+    :func:`get_compatibility_rules` 一致）。
+    """
+    # 纯参数校验（自配对、规范化、去重）在事务外完成，与数据库状态无关
+    normalized: set[tuple[str, str]] = set()
+    for index, (a, b) in enumerate(pairs, start=1):
+        if a == b:
+            raise LineageError(
+                422,
+                "self_pair",
+                f"第 {index} 条规则为自配对：'{a}' 与自身不能构成禁配对，整批规则未替换",
+            )
+        normalized.add((a, b) if a < b else (b, a))
+    ordered = sorted(normalized)
+
+    # IMMEDIATE：未登记 ID 校验与“清空 + 写入”在同一写事务内原子完成
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        referenced = sorted({sid for pair in ordered for sid in pair})
+        if referenced:
+            placeholders = ", ".join("?" for _ in referenced)
+            known = {
+                r["id"]
+                for r in conn.execute(
+                    "SELECT id FROM containers WHERE is_sample = 1"
+                    f" AND id IN ({placeholders})",
+                    referenced,
+                )
+            }
+            unknown = [sid for sid in referenced if sid not in known]
+            if unknown:
+                raise LineageError(
+                    422,
+                    "unknown_sample",
+                    (
+                        f"规则引用了尚未登记为初始样品的 ID：{unknown}，"
+                        "整批规则未替换"
+                    ),
+                    details={"unknown_samples": unknown},
+                )
+        conn.execute("DELETE FROM compatibility_rules")
+        conn.executemany(
+            "INSERT INTO compatibility_rules (source_a, source_b) VALUES (?, ?)",
+            ordered,
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return {"rules": [{"source_a": a, "source_b": b} for a, b in ordered]}
+
+
+def get_compatibility_rules(conn: sqlite3.Connection) -> dict:
+    """返回当前生效的全部禁配规则（规范化、按 (source_a, source_b) 排序）。"""
+    return {
+        "rules": [
+            {"source_a": a, "source_b": b}
+            for a, b in _load_compatibility_rules(conn)
+        ]
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -347,6 +447,13 @@ def _simulate_transfers(
     422 ``capacity_exceeded``，``details`` 含条目序号、目标与预计超出量；
     同批先转出再转入按模拟到本步时的当时余量判断。
 
+    每一步分摊并应用到目标之后做**祖先来源不相容校验**：目标容器此时的
+    **非零祖先集合**若同时含有某一禁配对（``compatibility_rules``）的双方，
+    即抛 422 ``incompatible_sources``，``details`` 含条目序号、目标容器与
+    排序后的全部冲突对。目标状态反映本批前序步骤的结果，故同批前序混合
+    产生的隐性祖先同样参与检查；份额为 0 的来源（最大余额法可能给极小
+    份额分出 0 个刻度）不计入非零祖先集合。
+
     若提供 ``expected_versions``，则在事务内对每个被触碰容器读取到的当前版本做
     乐观并发校验：任一不符即抛 409 stale_container（调用方负责回滚，整批不落库）。
     """
@@ -355,6 +462,8 @@ def _simulate_transfers(
     versions: Versions = {}
     capacities: dict[str, Decimal | None] = {}
     taken_steps: list[dict[str, Decimal]] = []
+    # 禁配规则在事务内一次读入：与状态读取同一快照，提交与预演一致
+    rules = _load_compatibility_rules(conn)
 
     for index, (src, dst, volume) in enumerate(prepared, start=1):
         # 未知容器（初始样品与空容器都在 containers 表中）
@@ -447,6 +556,31 @@ def _simulate_transfers(
             if src_state[sid] == 0:
                 del src_state[sid]
         taken_steps.append(taken)
+
+        # 祖先来源不相容约束：目标在本步分摊后的非零祖先集合不得同时含有
+        # 任一禁配对的双方。dst_state 已反映本批前序步骤的结果，故同批前序
+        # 混合产生的隐性祖先同样参与检查；0 份额来源不计入（见模块约定）。
+        if rules:
+            present = {sid for sid, amount in dst_state.items() if amount > 0}
+            hits = [(a, b) for a, b in rules if a in present and b in present]
+            if hits:
+                pairs_text = "、".join(f"({a}, {b})" for a, b in hits)
+                raise LineageError(
+                    422,
+                    "incompatible_sources",
+                    (
+                        f"第 {index} 条转移使目标 '{dst}' 的非零祖先集合同时含有"
+                        f"不相容来源 {pairs_text}，整批拒绝"
+                    ),
+                    # details 为机器可读字段：冲突对全部列出且按字典序排序
+                    details={
+                        "index": index,
+                        "destination": dst,
+                        "conflicts": [
+                            {"source_a": a, "source_b": b} for a, b in hits
+                        ],
+                    },
+                )
 
     return touched, versions, taken_steps, pre_states, capacities
 

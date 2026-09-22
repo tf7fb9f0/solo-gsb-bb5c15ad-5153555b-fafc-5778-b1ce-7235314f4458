@@ -17,6 +17,8 @@ from .schemas import (
     BatchTransferIn,
     BatchTransferOut,
     CapacityIn,
+    CompatibilityRulesIn,
+    CompatibilityRulesOut,
     ContainerIn,
     ContainerOut,
     ContainerStatusOut,
@@ -41,6 +43,10 @@ app = FastAPI(
         "在顺序模拟的每一步检查目标当前体积加转入量，任一目标超上限即整批拒绝"
         "（返回条目序号、目标与预计超出量），失败时状态、版本、幂等记录与审计链"
         "均不变化。"
+        "可维护祖先来源不相容规则（PUT/GET /compatibility/rules，无向禁配对，"
+        "原子全量替换）：批量提交与预演复用同一顺序模拟，在每一步分摊后检查"
+        "目标容器的非零祖先集合，命中禁配对即整批拒绝"
+        "（422 incompatible_sources，含条目序号、目标与排序后的全部冲突对）。"
         "支持 /transfers/preview 预演：与真实提交同一套校验与分摊，但不落库。"
         "/transfers/batch 支持可选 idempotency_key：成功请求的指纹与完整响应"
         "随转移同一事务持久化，同键同请求体重放、同键异请求体返回 409。"
@@ -48,7 +54,7 @@ app = FastAPI(
         "结果版本），以前一条记录的哈希形成可校验哈希链；"
         "失败 / 重放 / 预演均不产生审计记录。"
     ),
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -115,6 +121,29 @@ def set_container_capacity(
     conn: sqlite3.Connection = Depends(get_db),
 ) -> dict:
     return service.set_container_capacity(conn, container_id, body.capacity)
+
+
+@app.put(
+    "/compatibility/rules",
+    response_model=CompatibilityRulesOut,
+    tags=["compatibility"],
+    summary="原子全量替换祖先来源不相容规则（无向禁配对）",
+)
+def put_compatibility_rules(
+    body: CompatibilityRulesIn, conn: sqlite3.Connection = Depends(get_db)
+) -> dict:
+    pairs = [(r.source_a, r.source_b) for r in body.rules]
+    return service.replace_compatibility_rules(conn, pairs)
+
+
+@app.get(
+    "/compatibility/rules",
+    response_model=CompatibilityRulesOut,
+    tags=["compatibility"],
+    summary="查询当前生效的祖先来源不相容规则（规范化排序）",
+)
+def list_compatibility_rules(conn: sqlite3.Connection = Depends(get_db)) -> dict:
+    return service.get_compatibility_rules(conn)
 
 
 @app.post(
