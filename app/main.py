@@ -17,6 +17,8 @@ from .schemas import (
     BatchTransferIn,
     BatchTransferOut,
     CapacityIn,
+    CompatibilityRulesIn,
+    CompatibilityRulesOut,
     ContainerIn,
     ContainerOut,
     ContainerStatusOut,
@@ -41,6 +43,12 @@ app = FastAPI(
         "在顺序模拟的每一步检查目标当前体积加转入量，任一目标超上限即整批拒绝"
         "（返回条目序号、目标与预计超出量），失败时状态、版本、幂等记录与审计链"
         "均不变化。"
+        "PUT /compatibility/rules 原子全量替换祖先来源不相容禁配对"
+        "（无向去重、拒绝自配对与未登记初始样品的端点），"
+        "GET 返回规范化排序后的规则；批量提交与预演在每一步分摊后检查目标容器的"
+        "非零祖先集合，命中任一禁配对即整批拒绝（422 incompatible_sources，"
+        "返回条目序号、目标容器与排序后的全部冲突对；同批前序混合出的隐性祖先"
+        "同样参与检查），提交回滚、预演不写库，幂等重放返回首次成功结果。"
         "支持 /transfers/preview 预演：与真实提交同一套校验与分摊，但不落库。"
         "/transfers/batch 支持可选 idempotency_key：成功请求的指纹与完整响应"
         "随转移同一事务持久化，同键同请求体重放、同键异请求体返回 409。"
@@ -48,7 +56,7 @@ app = FastAPI(
         "结果版本），以前一条记录的哈希形成可校验哈希链；"
         "失败 / 重放 / 预演均不产生审计记录。"
     ),
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -115,6 +123,29 @@ def set_container_capacity(
     conn: sqlite3.Connection = Depends(get_db),
 ) -> dict:
     return service.set_container_capacity(conn, container_id, body.capacity)
+
+
+@app.put(
+    "/compatibility/rules",
+    response_model=CompatibilityRulesOut,
+    tags=["compatibility"],
+    summary="原子全量替换祖先来源不相容禁配对（无向、去重）",
+)
+def replace_compatibility_rules(
+    body: CompatibilityRulesIn, conn: sqlite3.Connection = Depends(get_db)
+) -> dict:
+    pairs = [(r.source_a, r.source_b) for r in body.rules]
+    return service.replace_compatibility_rules(conn, pairs)
+
+
+@app.get(
+    "/compatibility/rules",
+    response_model=CompatibilityRulesOut,
+    tags=["compatibility"],
+    summary="查询规范化排序后的祖先来源不相容禁配对",
+)
+def list_compatibility_rules(conn: sqlite3.Connection = Depends(get_db)) -> dict:
+    return service.get_compatibility_rules(conn)
 
 
 @app.post(

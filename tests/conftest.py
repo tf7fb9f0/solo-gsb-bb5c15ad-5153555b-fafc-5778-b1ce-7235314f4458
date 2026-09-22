@@ -29,6 +29,8 @@ def _clean_tables():
     try:
         # 审计表有只追加触发器（禁止 DELETE），需先临时摘除触发器再清空
         audit.reset_for_tests(conn)
+        # compatibility_rules 外键引用 containers，须先于 containers 清空
+        conn.execute("DELETE FROM compatibility_rules")
         conn.execute("DELETE FROM components")
         conn.execute("DELETE FROM containers")
         conn.execute("DELETE FROM idempotency_keys")

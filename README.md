@@ -13,6 +13,12 @@
   上限必须不小于当前体积）：批量提交与预演在顺序模拟的每一步检查
   “目标当前体积 + 转入量”，任一目标超上限即整批拒绝并返回**条目序号、目标与预计超出量**；
   同批先转出再转入按当时余量判断。容器查询返回**容量、剩余空间与利用率**。
+- 可通过 `PUT /compatibility/rules` 配置**祖先来源不相容规则**（无向禁配对，
+  `A-B` 与 `B-A` 等价去重，拒绝自配对，端点必须是已登记的**初始样品**）：
+  批量提交与预演在顺序模拟的**每一步分摊之后**检查目标容器的**非零祖先集合**，
+  命中任一禁配对即整批拒绝（`422 incompatible_sources`，返回**条目序号、目标容器与
+  排序后的全部冲突对**）；同批前序混合产生的隐性祖先同样参与后续检查。
+  提交整批回滚，预演不写库；`GET /compatibility/rules` 返回规范化排序后的规则。
 - 可用 `POST /transfers/preview` **预演**同一批转移：与真实提交完全相同的校验与分摊规则，
   返回每一步的扣取明细与受影响容器的最终状态，但**绝不写入数据库**。
 - 可选的**乐观并发保护**：每个容器持久化一个整数 `version`（创建时为 0），
@@ -73,6 +79,12 @@ SQLite 数据保存在 Docker 命名卷 `lineage-data`（容器内 `/data`）中
   `BEFORE UPDATE` / `BEFORE DELETE`，命中即 `RAISE`）。升级前的历史批次没有
   审计记录，审计链从升级后**第一个成功批次**开始，首条 `seq=1`、`prev_hash`
   为 `sha256("")`。
+- 旧库缺少 `containers.is_initial_sample` 列（初始样品标记）时自动补齐，
+  默认 `0`，并把 `components` 中存在 `(id, id)` 自祖先行的容器回填为 `1`
+  （初始样品是自身唯一祖先，该启发式对旧数据精确）；同时自动创建
+  `compatibility_rules`（`source_a` / `source_b` 双主键，均外键引用
+  `containers`，并以 `CHECK (source_a < source_b)` 保证无向对以规范方向落库），
+  升级后规则表为空（默认不限制任何来源混合）。
 
 升级步骤（保留数据）：
 
@@ -91,8 +103,9 @@ c = connect()
 print([r[0] for r in c.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")])
 print([r[1] for r in c.execute('PRAGMA table_info(containers)')])
 "
-# 应包含 idempotency_keys、audit_records、audit_record_containers 表，
-# containers 列中应包含 version 与 capacity；另应存在 4 个 audit_* 触发器
+# 应包含 idempotency_keys、compatibility_rules、audit_records、
+# audit_record_containers 表，containers 列中应包含 version、capacity 与
+# is_initial_sample；另应存在 4 个 audit_* 触发器
 ```
 
 停止与清理：
@@ -127,6 +140,10 @@ docker compose down -v       # 同时删除数据卷
 - 每个容器额外持久化一个整数 **`version`**：创建（样品/空容器）时为 `0`，每次成功的
   批量转移后被触碰的容器加 1（同批多次触碰只加 1），用于 `expected_versions` 乐观并发控制。
   服务启动时会自动为旧版本数据库补齐该列，已有容器的版本视为 `0`，无需手工迁移。
+- 每个容器还持久化布尔标记 **`is_initial_sample`**（`containers.is_initial_sample`）：
+  登记初始样品时为 `1`，登记空容器时为 `0`。祖先来源不相容规则只接受初始样品 ID 作为
+  禁配对端点（空容器永远不会成为任何容器的祖先来源）。旧库迁移时自动补齐该列：
+  存在 `(id, id)` 自祖先行的容器回填为 `1`，其余为 `0`。
 - 每个容器可持久化一个可选的 **`capacity`**（容量上限，`containers.capacity` 列）：
   `NULL` 表示不限制（新登记容器与旧库迁移来的容器默认如此）；非 NULL 为 Decimal 字符串，
   设置时必须不小于容器当前体积。批量提交与预演在顺序模拟的每一步检查
@@ -142,6 +159,11 @@ docker compose down -v       # 同时删除数据卷
   连续递增，`prev_hash` 指向前一条记录、首条为 `sha256("")`，`entry_hash` 覆盖
   前一条哈希、序号与规范化载荷。两表均有 `BEFORE UPDATE` / `BEFORE DELETE`
   触发器，任何应用连接都无法修改或删除既有审计行；失败批次、幂等重放、预演不写。
+- 表 **`compatibility_rules`** 保存祖先来源不相容禁配对：`source_a` / `source_b`
+  双主键、均外键引用 `containers(id)`，`CHECK (source_a < source_b)` 保证无向对总以
+  字典序规范方向落库。`PUT /compatibility/rules` 对该表做**原子全量替换**
+  （一个事务内清空 + 重插）；规则配置不递增容器 `version`、不产生审计记录。
+  该表在批量提交与预演的顺序模拟开始时一次性读取为规则快照。
 
 ---
 
@@ -196,7 +218,67 @@ curl -X PUT http://localhost:8000/containers/V1/capacity \
 - 容量修改**不是**批量转移：不递增 `version`、不产生审计记录；
 - 未设置容量的容器（含旧库迁移来的容器）一律不限制。
 
-### 4. 批量转移（整批原子，按数组顺序依次执行）
+### 4. 祖先来源不相容规则（无向禁配对）
+
+某些初始样品来源不能共存于同一容器。用 `PUT /compatibility/rules` 配置禁配对：
+
+- **原子全量替换**：请求体即替换后的完整规则集（服务端在一个事务内清空旧表并重插），
+  任一条目不合法则整批拒绝、**旧规则保持不变**；传空列表即清空全部规则；
+- **无向、去重**：`A-B` 与 `B-A` 是同一条规则，端点按字典序规范化存储
+  （`source_a < source_b`，数据库 `CHECK` 约束兜底），重复条目自动去重；
+- **拒绝自配对**：`source_a == source_b` 返回 `422 incompatible_self_pair`，
+  `details` 给出条目序号与端点 ID；
+- **端点必须是已登记的初始样品**：端点不存在，或只是空容器（永远不会成为祖先来源），
+  返回 `422 source_not_initial_sample`，`details` 给出端点 ID；
+- 规则配置**不是**批量转移：不递增容器 `version`、不产生审计记录；
+- `GET /compatibility/rules` 返回规范化排序（按 `source_a`、`source_b` 升序）后的规则。
+
+```bash
+# 登记两个初始样品
+curl -X POST http://localhost:8000/samples \
+  -H 'Content-Type: application/json' -d '{"sample_id":"S1","volume":"100"}'
+curl -X POST http://localhost:8000/samples \
+  -H 'Content-Type: application/json' -d '{"sample_id":"S2","volume":"100"}'
+curl -X POST http://localhost:8000/containers \
+  -H 'Content-Type: application/json' -d '{"container_id":"V1"}'
+
+# 全量替换为两条规则（反向对 B-A 会被规范化、与 A-B 去重）
+curl -X PUT http://localhost:8000/compatibility/rules \
+  -H 'Content-Type: application/json' \
+  -d '{"rules":[
+    {"source_a":"S2","source_b":"S1"},
+    {"source_a":"S1","source_b":"S2"}
+  ]}'
+# 200 -> {"count":1,"rules":[{"source_a":"S1","source_b":"S2"}]}
+
+# 查询
+curl http://localhost:8000/compatibility/rules
+# 200 -> {"count":1,"rules":[{"source_a":"S1","source_b":"S2"}]}
+
+# 清空全部规则
+curl -X PUT http://localhost:8000/compatibility/rules \
+  -H 'Content-Type: application/json' -d '{"rules":[]}'
+# 200 -> {"count":0,"rules":[]}
+```
+
+非法规则的错误响应：
+
+```json
+// 自配对（422 incompatible_self_pair）
+{"error":{"code":"incompatible_self_pair",
+  "message":"第 1 条规则为自配对：'S1' 不能与自身不相容",
+  "details":{"index":1,"source_id":"S1"}}}
+
+// 端点未登记或不是初始样品（422 source_not_initial_sample）
+{"error":{"code":"source_not_initial_sample",
+  "message":"规则端点 'V1' 尚未登记为初始样品（未知 ID 或仅为空容器），不能配置不相容规则",
+  "details":{"source_id":"V1"}}}
+```
+
+规则生效于批量提交与预演的顺序模拟：**每一步分摊之后**检查目标容器的**非零祖先集合**，
+若同时包含任一禁配对的两端，即返回 `422 incompatible_sources`（详见下一节）。
+
+### 5. 批量转移（整批原子，按数组顺序依次执行）
 
 ```bash
 curl -X POST http://localhost:8000/transfers/batch \
@@ -329,6 +411,7 @@ curl -X POST http://localhost:8000/transfers/batch \
 | `source` 与 `destination` 相同 | 422 | `self_transfer` |
 | 转移体积大于源容器当前体积 | 422 | `insufficient_volume` |
 | 目标当前体积 + 转入量超过其容量上限 | 422 | `capacity_exceeded` |
+| 分摊后目标容器的非零祖先集合命中不相容禁配对 | 422 | `incompatible_sources` |
 | 体积为 0、为负、非有限数，或小数位超过 `DECIMAL_SCALE` | 422 | `invalid_volume` |
 | `expected_versions` 未恰好覆盖本批全部源/目标（含空对象） | 422 | `invalid_expected_versions` |
 | `expected_versions` 中某容器版本与当前版本不符 | 409 | `stale_container` |
@@ -367,12 +450,53 @@ curl -X POST http://localhost:8000/transfers/batch \
 上限小于当前体积返回 `422 capacity_below_volume`（`details` 含
 `container_id` / `capacity` / `current_volume`）。
 
+#### 祖先来源不相容校验
+
+配置了禁配对后，批量提交与预演在顺序模拟的**每一步分摊之后**检查目标容器的
+**非零祖先集合**：
+
+```bash
+# S1-S2 禁配
+curl -X PUT http://localhost:8000/compatibility/rules \
+  -H 'Content-Type: application/json' \
+  -d '{"rules":[{"source_a":"S1","source_b":"S2"}]}'
+
+# 先转入 S1（合法），再转入 S2：命中规则，整批拒绝
+curl -X POST http://localhost:8000/transfers/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"transfers":[
+    {"source":"S1","destination":"V1","volume":"10"},
+    {"source":"S2","destination":"V1","volume":"10"}
+  ]}'
+# 422 -> {"error":{"code":"incompatible_sources",
+#   "message":"第 2 条转移后目标容器 'V1' 中同时存在不相容的祖先来源（冲突对 [('S1', 'S2')]），整批拒绝",
+#   "details":{"index":2,"destination":"V1",
+#              "conflicts":[{"source_a":"S1","source_b":"S2"}]}}}
+```
+
+要点：
+
+- `details` 给出**条目序号**（1 基）、**目标容器**与**排序后的全部冲突对**
+  （目标一次混入多个来源、同时命中多条规则时全部列出，按 `source_a`、`source_b` 排序）；
+- 检查针对**分摊后**的非零祖先集合：规则是无向的，与转入方向无关；同批中先把某祖先
+  完全转出（份额归零、离开非零集合）后再混合是合法的；源容器自身已有冲突只影响它
+  作为**目标**的步骤，从其转出不额外受限；
+- **同批前序混合产生的隐性祖先同样参与后续检查**：例如批内先把 `S1` 混入 `V1`、
+  再把 `V1` 的混合液转入 `V2`，最后向 `V2` 加入 `S2`，第 3 步仍会因 `V2` 中
+  经 `V1` 传播来的 `S1` 而命中 `S1-S2`；
+- 规则在模拟开始时一次性读取：提交与预演使用**同一顺序模拟、同一份规则快照**，
+  两者的状态码、错误码、条目序号、`details` 完全一致；
+- 任一目标命中即整批回滚——容器状态、`version`、幂等记录与审计链均不变化；
+  预演同样返回该错误但绝不写库；
+- 已成功请求的**幂等重放**直接返回首次结果，不重新校验规则（事后新增规则不影响
+  重放）；规则配置本身（`PUT`）不递增版本、不产生审计。
+
 审计查询接口（`GET /audit/records`）的参数错误使用同一错误响应结构：
 未知容器 `404 unknown_container`、序号范围非法（`<1` 或 `end<start`）
 `422 invalid_seq_range`、`limit` 越界 `422 invalid_limit`；
 `GET /audit/verify` 不返回错误码——链是否完好始终是 200 响应中的 `valid` 字段。
 
-### 5. 预演批量转移（不落库）
+### 6. 预演批量转移（不落库）
 
 `POST /transfers/preview` 使用与批量提交**完全相同的请求结构**（同样接受可选的
 `expected_versions`；`idempotency_key` 字段虽可出现但会被**忽略**——预演不查重、
@@ -388,6 +512,8 @@ curl -X POST http://localhost:8000/transfers/batch \
 预演与真实提交**共用同一套校验、版本校验与分摊代码**：提供 `expected_versions` 时，
 覆盖错误同样返回 `422 invalid_expected_versions`、版本不符同样返回
 `409 stale_container`，目标容量超限同样返回 `422 capacity_exceeded`（含 `details`），
+目标祖先来源命中禁配对同样返回 `422 incompatible_sources`（含条目序号、目标与
+全部冲突对，同批前序混合出的隐性祖先也参与检查），
 HTTP 状态码、`error.code` 以及消息中的条目序号（“第 N 条转移”）
 均与 `/transfers/batch` 完全一致。预演**只读不写、不递增版本**，成功或失败都不会改变
 数据库，可以安全地重复调用；因此可用于“先核对预期版本、确认提交后版本，再正式提交”。
@@ -446,7 +572,7 @@ curl -X POST http://localhost:8000/transfers/preview \
 S1 取 10、S2 取 15；调用后数据库中 S1/S2 仍为 100、V1/V2 仍为空，版本也都保持 0；
 各容器返回的 `"version": 1` 是**预测**真实提交后的版本（当前 0 + 1）。
 
-### 6. 查询容器当前体积、容量与来源占比
+### 7. 查询容器当前体积、容量与来源占比
 
 ```bash
 curl http://localhost:8000/containers/V1
@@ -487,8 +613,9 @@ curl http://localhost:8000/containers/V1
 容器扣减、`version` 递增、幂等行所在的**同一个 SQLite 事务**内追加一条审计记录，
 因此审计记录与业务状态要么同时可见、要么一起回滚：
 
-- **失败不留痕**：任何 4xx（参数错误、源液不足、未知容器、自转移、`stale_container`、
-  `idempotency_conflict` 等）整批回滚，审计行一起回滚；
+- **失败不留痕**：任何 4xx（参数错误、源液不足、未知容器、自转移、容量超限、
+  祖先来源不相容、`stale_container`、`idempotency_conflict` 等）整批回滚，
+  审计行一起回滚；
 - **预演不留痕**：`/transfers/preview` 只读，成功失败都不写审计；
 - **幂等重放不留痕**：同键同请求体重放直接返回首次响应，不执行转移也不追加审计记录。
 
@@ -522,7 +649,7 @@ INSERT，不提供修改/删除审计记录的 API。
 > 防写保护；需要更强保证时可定期把 `GET /audit/verify` 与最后一条 `entry_hash`
 > 存放到带外（如离线 WORM / 另一台主机）。
 
-### 7. 查询审计记录：按容器与序号范围
+### 8. 查询审计记录：按容器与序号范围
 
 ```bash
 # 全部记录（按 seq 升序，默认 limit=100，最大 1000）
@@ -587,7 +714,7 @@ curl 'http://localhost:8000/audit/records?start_seq=2&end_seq=10&limit=20'
 }
 ```
 
-### 8. 校验整条审计链
+### 9. 校验整条审计链
 
 ```bash
 curl http://localhost:8000/audit/verify
@@ -669,9 +796,9 @@ pytest -q
 ```
 app/
   config.py     # 环境变量配置
-  db.py         # SQLite 连接、建库（启动时执行，含审计表与只追加触发器迁移）
+  db.py         # SQLite 连接、建库（启动时执行，含规则表、审计表与只追加触发器迁移）
   schemas.py    # Pydantic 请求/响应模型（Decimal <-> 字符串）
-  service.py    # 核心逻辑：登记、批量转移事务、比例分摊、查询
+  service.py    # 核心逻辑：登记、规则全量替换、批量转移事务、比例分摊、不相容检查、查询
   audit.py      # 只追加审计链：载荷规范化、哈希、同事务追加、查询、链校验
   main.py       # FastAPI 路由与错误处理（含 /audit/records、/audit/verify）
 tests/          # pytest 端到端、分摊算法、幂等与审计链测试

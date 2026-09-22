@@ -20,6 +20,9 @@ CREATE TABLE IF NOT EXISTS containers (
     version INTEGER NOT NULL DEFAULT 0,
     -- 容量上限：NULL 表示不限制；非 NULL 为 Decimal 字符串，必须 >= 当前体积
     capacity TEXT,
+    -- 是否为“初始样品”（自身唯一祖先来源）：登记初始样品为 1，空容器为 0。
+    -- 祖先来源不相容规则只允许以初始样品 ID 作为禁配对端点。
+    is_initial_sample INTEGER NOT NULL DEFAULT 0,
     created INTEGER NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
@@ -46,15 +49,28 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     response_body   TEXT NOT NULL,
     created INTEGER NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- 祖先来源不相容规则：无向禁配对（A-B 与 B-A 视为同一条）。
+-- 两个端点都以规范方向（source_a < source_b）存储，CHECK 保证落库即规范；
+-- 端点必须是已登记的初始样品（见 containers.is_initial_sample），
+-- 且不允许自配对——这两点由 PUT /compatibility/rules 在应用层校验。
+CREATE TABLE IF NOT EXISTS compatibility_rules (
+    source_a TEXT NOT NULL REFERENCES containers(id),
+    source_b TEXT NOT NULL REFERENCES containers(id),
+    -- 无向对的规范方向：source_a 字典序严格小于 source_b
+    CHECK (source_a < source_b),
+    PRIMARY KEY (source_a, source_b)
+);
 """ + AUDIT_SCHEMA_SQL
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
     """对已有数据库做幂等升级（旧库没有 containers.version / capacity 列）。
 
-    ``idempotency_keys`` 与审计链相关的表（``audit_records``、
-    ``audit_record_containers``）由建表脚本中的 ``CREATE TABLE IF NOT EXISTS``
-    负责补齐，旧库升级时自动创建，无需手工迁移；只追加审计触发器在此幂等安装。
+    ``idempotency_keys``、``compatibility_rules`` 与审计链相关的表
+    （``audit_records``、``audit_record_containers``）由建表脚本中的
+    ``CREATE TABLE IF NOT EXISTS`` 负责补齐，旧库升级时自动创建，无需手工迁移；
+    只追加审计触发器在此幂等安装。
     """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(containers)")}
     if columns and "version" not in columns:
@@ -65,6 +81,20 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if columns and "capacity" not in columns:
         # 旧库中的容器一律不限制容量（NULL）
         conn.execute("ALTER TABLE containers ADD COLUMN capacity TEXT")
+    if columns and "is_initial_sample" not in columns:
+        # 旧库中的容器一律回填为“非初始样品”（DEFAULT 0），随后把
+        # components 中存在 (id, id) 自祖先行的容器标记为初始样品：
+        # 初始样品是自身唯一祖先，空容器没有 components 行，混合容器的
+        # components.source_id 不会等于自身 ID，因此该启发式对旧数据精确。
+        conn.execute(
+            "ALTER TABLE containers ADD COLUMN is_initial_sample"
+            " INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute(
+            "UPDATE containers SET is_initial_sample = 1 WHERE id IN ("
+            "SELECT c.id FROM containers c"
+            " JOIN components p ON p.container_id = c.id AND p.source_id = c.id)"
+        )
     # 审计表的只追加触发器（BEFORE UPDATE/DELETE -> RAISE），已存在则跳过
     install_audit_triggers(conn)
 
